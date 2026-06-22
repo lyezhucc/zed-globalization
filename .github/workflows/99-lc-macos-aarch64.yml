@@ -1,0 +1,354 @@
+name: 99 LC macOS Apple Silicon
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Zed official tag to build"
+        type: string
+        default: "v1.8.0-pre"
+      lang:
+        description: "Target language"
+        type: choice
+        options:
+          - zh-CN
+          - zh-TW
+          - ja
+          - ko
+        default: zh-CN
+      jobs:
+        description: "Cargo build jobs"
+        type: number
+        default: 4
+      use_sccache:
+        description: "Use sccache and GitHub cache"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: lc-macos-aarch64-${{ inputs.version }}-${{ inputs.lang }}
+  cancel-in-progress: false
+
+env:
+  ZED_REPO: https://github.com/zed-industries/zed.git
+  BUILD_VERSION: ${{ inputs.version }}
+  TARGET_LANG: ${{ inputs.lang }}
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  SCCACHE_DIR: /Users/runner/Library/Caches/Mozilla.sccache
+  SCCACHE_CACHE_SIZE: "10G"
+  SCCACHE_IDLE_TIMEOUT: "0"
+
+jobs:
+  build-macos-aarch64:
+    name: Build macOS Apple Silicon
+    runs-on: macos-latest
+    steps:
+      - name: Checkout globalization repo
+        uses: actions/checkout@v4
+
+      - name: Install zedl10n
+        run: python3 -m pip install .
+
+      - name: Clone Zed source
+        run: |
+          git clone --depth 1 --branch "$BUILD_VERSION" "$ZED_REPO" zed
+          echo "Checked out Zed $BUILD_VERSION"
+
+      - name: Apply ZedG rebrand
+        run: python3 scripts/rebrand.py --zed-dir zed
+
+      - name: Fetch translation data
+        run: |
+          git fetch origin i18n
+          git checkout origin/i18n -- i18n/ 2>/dev/null || mkdir -p i18n
+          git checkout origin/i18n -- string.json
+          git checkout origin/i18n -- config/do_not_translate.json
+
+      - name: Select and overlay translation
+        run: |
+          set -euo pipefail
+
+          TRANS=$(python3 <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          build_version = os.environ["BUILD_VERSION"]
+          target_lang = os.environ["TARGET_LANG"]
+
+          def version_key(tag: str) -> tuple[int, ...]:
+              raw = tag[1:] if tag.startswith("v") else tag
+              is_pre = 0 if raw.endswith("-pre") else 1
+              raw = raw.removesuffix("-pre")
+              parts = [int(part) for part in re.findall(r"\d+", raw)]
+              return tuple(parts + [is_pre])
+
+          exact = Path("i18n") / build_version / f"{target_lang}.json"
+          if exact.exists():
+              print(exact)
+              print(f"Using exact translation: {exact}", file=sys.stderr)
+              raise SystemExit(0)
+
+          cur_key = version_key(build_version)
+          candidates: list[tuple[tuple[int, ...], str, Path]] = []
+          for path in Path("i18n").glob(f"v*/{target_lang}.json"):
+              version = path.parent.name
+              candidates.append((version_key(version), version, path))
+          candidates.sort(key=lambda item: item[0])
+
+          newer = next((item for item in candidates if item[0] > cur_key), None)
+          older = next((item for item in reversed(candidates) if item[0] < cur_key), None)
+          chosen = newer or older
+          if chosen:
+              _, version, path = chosen
+              direction = "newer" if chosen is newer else "older"
+              print(path)
+              print(f"Using nearest {direction} translation {version}: {path}", file=sys.stderr)
+              raise SystemExit(0)
+
+          flat = Path("i18n") / f"{target_lang}.json"
+          if flat.exists():
+              print(flat)
+              print(f"Using flat translation: {flat}", file=sys.stderr)
+              raise SystemExit(0)
+
+          fallback = Path("i18n") / build_version / f"{target_lang}.json"
+          fallback.parent.mkdir(parents=True, exist_ok=True)
+          fallback.write_text("{}\n", encoding="utf-8")
+          print(fallback)
+          print("No translation found; using empty file", file=sys.stderr)
+          PY
+          )
+
+          FINAL_TRANS="$TRANS"
+          if [ "$TARGET_LANG" = "zh-CN" ]; then
+            OVERLAY="${TRANS%.json}.lc-overlay.json"
+            REPORT="${TRANS%.json}.lc-overlay-report.json"
+
+            python3 scripts/apply_lc_overlay.py \
+              --strings string.json \
+              --translation "$TRANS" \
+              --memory config/lc-overlay/translation-memory.zh-CN.json \
+              --output "$OVERLAY" \
+              --report "$REPORT"
+
+            FINAL_TRANS="$OVERLAY"
+            echo "LC_OVERLAY_REPORT=$REPORT" >> "$GITHUB_ENV"
+          fi
+
+          LANG_LOWER=$(echo "$TARGET_LANG" | tr '[:upper:]' '[:lower:]')
+          echo "LOCALIZED_TRANSLATION=$FINAL_TRANS" >> "$GITHUB_ENV"
+          echo "LANG_LOWER=$LANG_LOWER" >> "$GITHUB_ENV"
+          echo "Using localized translation: $FINAL_TRANS"
+
+      - name: Replace localized strings
+        run: |
+          zedl10n replace \
+            --input "$LOCALIZED_TRANSLATION" \
+            --source-root zed \
+            --do-not-translate config/do_not_translate.json
+
+      - name: Upload LC overlay report
+        if: ${{ inputs.lang == 'zh-CN' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lc-overlay-report-${{ inputs.version }}
+          path: i18n/**/*.lc-overlay-report.json
+          retention-days: 14
+
+      - name: Patch agent environment
+        run: python3 patch_agent_env.py --source-root zed
+
+      - name: Install sccache
+        if: ${{ inputs.use_sccache == true }}
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: Check sccache
+        run: |
+          if [ "${{ inputs.use_sccache }}" = "true" ] && command -v sccache >/dev/null && sccache --version >/dev/null; then
+            echo "SCCACHE_AVAILABLE=true" >> "$GITHUB_ENV"
+            echo "sccache is available"
+          else
+            echo "SCCACHE_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "sccache is disabled or unavailable"
+          fi
+
+      - name: Restore Rust and sccache cache
+        if: ${{ inputs.use_sccache == true }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /Users/runner/Library/Caches/Mozilla.sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: lc-sccache-macos-aarch64-${{ inputs.version }}-${{ hashFiles('zed/Cargo.lock') }}
+          restore-keys: |
+            lc-sccache-macos-aarch64-${{ inputs.version }}-
+            lc-sccache-macos-aarch64-
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build aarch64 release
+        env:
+          RELEASE_CHANNEL: stable
+        run: |
+          set -euo pipefail
+
+          if [ "$SCCACHE_AVAILABLE" = "true" ]; then
+            export RUSTC_WRAPPER=sccache
+            sccache --start-server
+            sccache --zero-stats
+          else
+            export RUSTC_WRAPPER=""
+          fi
+
+          MEM_LOG="/tmp/mem_monitor.csv"
+          echo "timestamp,used_mb,total_mb,swap_used_mb,swap_total_mb" > "$MEM_LOG"
+          (
+            TOTAL_MB=$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
+            PAGE_SIZE=$(vm_stat | head -1 | grep -oE '[0-9]+')
+            while true; do
+              FREE_PAGES=$(vm_stat | awk '/Pages free/ {print $NF}' | tr -d '.')
+              INACTIVE_PAGES=$(vm_stat | awk '/Pages inactive/ {print $NF}' | tr -d '.')
+              SPECULATIVE_PAGES=$(vm_stat | awk '/Pages speculative/ {print $NF}' | tr -d '.')
+              AVAIL_MB=$(( (${FREE_PAGES:-0} + ${INACTIVE_PAGES:-0} + ${SPECULATIVE_PAGES:-0}) * PAGE_SIZE / 1024 / 1024 ))
+              USED_MB=$(( TOTAL_MB - AVAIL_MB ))
+              SWAP_USED_MB=$(sysctl -n vm.swapusage | awk -F'[= ]+' '{for(i=1;i<=NF;i++) if($i=="used") printf "%d", $(i+1)}')
+              SWAP_TOTAL_MB=$(sysctl -n vm.swapusage | awk -F'[= ]+' '{for(i=1;i<=NF;i++) if($i=="total") printf "%d", $(i+1)}')
+              echo "$(date +%H:%M:%S),$USED_MB,$TOTAL_MB,${SWAP_USED_MB:-0},${SWAP_TOTAL_MB:-0}" >> "$MEM_LOG"
+              sleep 10
+            done
+          ) &
+          MONITOR_PID=$!
+
+          set +e
+          python3 "$GITHUB_WORKSPACE/script/ci-build.py" \
+            --source-dir "$GITHUB_WORKSPACE/zed" \
+            --target aarch64-apple-darwin \
+            --jobs "${{ inputs.jobs }}"
+          BUILD_EXIT=$?
+          set -e
+
+          kill "$MONITOR_PID" 2>/dev/null || true
+          wait "$MONITOR_PID" 2>/dev/null || true
+
+          echo "===== Memory summary ====="
+          PEAK_MEM=$(tail -n +2 "$MEM_LOG" | cut -d, -f2 | sort -n | tail -1)
+          PEAK_SWAP=$(tail -n +2 "$MEM_LOG" | cut -d, -f4 | sort -n | tail -1)
+          TOTAL_MEM=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f3)
+          SAMPLES=$(tail -n +2 "$MEM_LOG" | wc -l | tr -d ' ')
+          echo "Physical memory peak: ${PEAK_MEM:-0}MB / ${TOTAL_MEM:-0}MB"
+          echo "Swap peak: ${PEAK_SWAP:-0}MB"
+          echo "Samples: ${SAMPLES:-0}"
+          [ "$BUILD_EXIT" -ne 0 ] && exit "$BUILD_EXIT"
+
+          cargo build \
+            --release \
+            --package cli \
+            --target aarch64-apple-darwin \
+            --manifest-path "$GITHUB_WORKSPACE/zed/Cargo.toml"
+
+      - name: Show sccache stats
+        if: ${{ always() && inputs.use_sccache == true }}
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
+
+      - name: Save Rust and sccache cache
+        if: ${{ always() && inputs.use_sccache == true }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /Users/runner/Library/Caches/Mozilla.sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: lc-sccache-macos-aarch64-${{ inputs.version }}-${{ hashFiles('zed/Cargo.lock') }}-${{ github.run_id }}
+
+      - name: Package DMG
+        run: |
+          set -euo pipefail
+
+          ZED_BIN="zed/target/aarch64-apple-darwin/release/zed"
+          CLI_BIN="zed/target/aarch64-apple-darwin/release/cli"
+          test -x "$ZED_BIN"
+          test -x "$CLI_BIN"
+          strip -x "$ZED_BIN" "$CLI_BIN" || true
+
+          ICONSET_DIR="AppIcon.iconset"
+          ICON_SRC="zed/crates/zed/resources/app-icon@2x.png"
+          mkdir -p "$ICONSET_DIR"
+          if [ -f "$ICON_SRC" ]; then
+            sips -z 16 16     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16.png"
+            sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16@2x.png"
+            sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_32x32.png"
+            sips -z 64 64     "$ICON_SRC" --out "$ICONSET_DIR/icon_32x32@2x.png"
+            sips -z 128 128   "$ICON_SRC" --out "$ICONSET_DIR/icon_128x128.png"
+            sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_128x128@2x.png"
+            sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256.png"
+            sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256@2x.png"
+            sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_512x512.png"
+            cp "$ICON_SRC" "$ICONSET_DIR/icon_512x512@2x.png"
+            iconutil -c icns "$ICONSET_DIR" -o AppIcon.icns
+          fi
+
+          APP="ZedG.app"
+          rm -rf "$APP" dmg-staging
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$ZED_BIN" "$APP/Contents/MacOS/zed"
+          cp "$CLI_BIN" "$APP/Contents/MacOS/cli"
+          chmod +x "$APP/Contents/MacOS/zed" "$APP/Contents/MacOS/cli"
+          [ -f AppIcon.icns ] && cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          [ -f "zed/crates/zed/resources/Document.icns" ] && cp zed/crates/zed/resources/Document.icns "$APP/Contents/Resources/"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key><string>zed</string>
+              <key>CFBundleIdentifier</key><string>dev.zed.ZedG</string>
+              <key>CFBundleName</key><string>ZedG</string>
+              <key>CFBundleDisplayName</key><string>ZedG</string>
+              <key>CFBundleIconFile</key><string>AppIcon</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>${BUILD_VERSION}</string>
+              <key>LSMinimumSystemVersion</key><string>13.0</string>
+          </dict>
+          </plist>
+          PLIST
+
+          codesign --force --deep --sign - "$APP" || true
+
+          mkdir -p dmg-staging
+          mv "$APP" dmg-staging/ZedG.app
+          ln -s /Applications dmg-staging/Applications
+
+          DMG_NAME="zedg-${LANG_LOWER}-macos-aarch64-${BUILD_VERSION}.dmg"
+          n=0
+          until [ "$n" -ge 10 ]; do
+            hdiutil create -volname ZedG -srcfolder dmg-staging -ov -format UDZO "$DMG_NAME" && break
+            n=$((n + 1))
+            echo "hdiutil failed; retrying in 15s ($n/10)"
+            sleep 15
+          done
+
+          test -f "$DMG_NAME"
+          echo "DMG_NAME=$DMG_NAME" >> "$GITHUB_ENV"
+          echo "Created $DMG_NAME ($(du -sh "$DMG_NAME" | cut -f1))"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: zedg-macos-aarch64-${{ inputs.version }}
+          path: zedg-*-macos-aarch64-${{ inputs.version }}.dmg
+          retention-days: 14
