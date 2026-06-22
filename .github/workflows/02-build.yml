@@ -184,8 +184,34 @@ jobs:
 
           echo "trans_file=$TRANS" >> $GITHUB_OUTPUT
 
+      - name: 应用 LC 深度中文覆盖层
+        id: lc_overlay
+        if: ${{ needs.versioning.outputs.lang == 'zh-CN' }}
+        run: |
+          TRANS="${{ steps.get_trans.outputs.trans_file }}"
+          OVERLAY="${TRANS%.json}.lc-overlay.json"
+          REPORT="${TRANS%.json}.lc-overlay-report.json"
+
+          python3 scripts/apply_lc_overlay.py \
+            --strings string.json \
+            --translation "$TRANS" \
+            --memory config/lc-overlay/translation-memory.zh-CN.json \
+            --output "$OVERLAY" \
+            --report "$REPORT"
+
+          echo "trans_file=$OVERLAY" >> $GITHUB_OUTPUT
+          echo "report_file=$REPORT" >> $GITHUB_OUTPUT
+
       - name: 执行本地化替换
-        run: zedl10n replace --input "${{ steps.get_trans.outputs.trans_file }}" --source-root zed --do-not-translate config/do_not_translate.json
+        run: zedl10n replace --input "${{ steps.lc_overlay.outputs.trans_file || steps.get_trans.outputs.trans_file }}" --source-root zed --do-not-translate config/do_not_translate.json
+
+      - name: 上传 LC 覆盖层报告
+        if: ${{ steps.lc_overlay.outputs.report_file != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lc-overlay-report
+          path: ${{ steps.lc_overlay.outputs.report_file }}
+          retention-days: 7
 
       - name: 应用 Agent 环境变量补丁
         run: python3 patch_agent_env.py --source-root zed
