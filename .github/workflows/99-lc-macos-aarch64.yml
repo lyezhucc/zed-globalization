@@ -379,13 +379,13 @@ jobs:
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${ASSETS[@]}" --clobber
-          else
-            EXTRA_FLAGS=()
-            if [[ "$BUILD_VERSION" == *"-pre" ]]; then
-              EXTRA_FLAGS+=(--prerelease)
-            fi
+          elif [[ "$BUILD_VERSION" == *"-pre" ]]; then
             gh release create "$RELEASE_TAG" "${ASSETS[@]}" \
               --title "$RELEASE_TITLE" \
               --notes "Built from workflow run: $RUN_URL" \
-              "${EXTRA_FLAGS[@]}"
+              --prerelease
+          else
+            gh release create "$RELEASE_TAG" "${ASSETS[@]}" \
+              --title "$RELEASE_TITLE" \
+              --notes "Built from workflow run: $RUN_URL"
           fi
