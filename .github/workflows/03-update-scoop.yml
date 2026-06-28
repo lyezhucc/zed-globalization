@@ -1,9 +1,6 @@
 name: 03 更新 Scoop Manifest
 
 on:
-  release:
-    types: [published]
-
   workflow_dispatch:
     inputs:
       version_tag:
@@ -32,9 +29,6 @@ permissions:
 jobs:
   update-bucket:
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'release'
     steps:
       - name: 生成并推送 Manifest
         env:
