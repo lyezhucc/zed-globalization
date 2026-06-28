@@ -26,7 +26,7 @@ on:
         default: true
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 concurrency:
@@ -357,3 +357,35 @@ jobs:
           name: zedg-macos-aarch64-${{ inputs.version }}
           path: zedg-*-macos-aarch64-${{ inputs.version }}.dmg
           retention-days: 14
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="$BUILD_VERSION"
+          RELEASE_TITLE="ZedG LC ${TARGET_LANG} ${BUILD_VERSION}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          DMG_FILE=$(find . -maxdepth 1 -name "zedg-*-macos-aarch64-${BUILD_VERSION}.dmg" -print -quit)
+          REPORT_FILE=$(find i18n -name '*.lc-overlay-report.json' -print -quit || true)
+
+          test -n "$DMG_FILE"
+
+          ASSETS=("$DMG_FILE")
+          if [ -n "${REPORT_FILE:-}" ]; then
+            ASSETS+=("$REPORT_FILE")
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${ASSETS[@]}" --clobber
+          else
+            EXTRA_FLAGS=()
+            if [[ "$BUILD_VERSION" == *"-pre" ]]; then
+              EXTRA_FLAGS+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${ASSETS[@]}" \
+              --title "$RELEASE_TITLE" \
+              --notes "Built from workflow run: $RUN_URL" \
+              "${EXTRA_FLAGS[@]}"
+          fi
