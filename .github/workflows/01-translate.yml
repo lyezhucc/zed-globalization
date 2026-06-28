@@ -45,6 +45,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 env:
   ZED_REPO: https://github.com/zed-industries/zed.git
@@ -214,7 +215,25 @@ jobs:
           echo "EXTRACT_MODE=$EXTRACT_MODE" >> $GITHUB_OUTPUT
           echo "提取模式: $EXTRACT_MODE"
 
+      - name: 确定同步策略
+        id: strategy
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          TARGET_LANG: ${{ steps.params.outputs.TARGET_LANG }}
+        run: |
+          if [ -n "$AI_API_KEY" ]; then
+            echo "mode=ai" >> $GITHUB_OUTPUT
+            echo "使用 AI 翻译模式"
+          elif [ "$TARGET_LANG" = "zh-CN" ]; then
+            echo "mode=sync_upstream" >> $GITHUB_OUTPUT
+            echo "未配置 AI key，切换为上游 i18n 同步模式"
+          else
+            echo "::error::未配置 AI_API_KEY，且当前仅支持 zh-CN 的上游同步模式"
+            exit 1
+          fi
+
       - name: 克隆 Zed 源码
+        if: steps.strategy.outputs.mode == 'ai'
         env:
           NEW_VER: ${{ steps.params.outputs.VERSION }}
         run: |
@@ -230,6 +249,7 @@ jobs:
           fi
 
       - name: 提取字符串
+        if: steps.strategy.outputs.mode == 'ai'
         env:
           NEW_VER: ${{ steps.params.outputs.VERSION }}
           EXTRACT_MODE: ${{ steps.params.outputs.EXTRACT_MODE }}
@@ -323,6 +343,7 @@ jobs:
           PYEOF
 
       - name: 准备基础翻译
+        if: steps.strategy.outputs.mode == 'ai'
         env:
           VERSION: ${{ steps.params.outputs.VERSION }}
           TARGET_LANG: ${{ steps.params.outputs.TARGET_LANG }}
@@ -357,6 +378,7 @@ jobs:
           echo "翻译文件: $TRANS_FILE ($(wc -c < "$TRANS_FILE") bytes)"
 
       - name: AI 翻译
+        if: steps.strategy.outputs.mode == 'ai'
         env:
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
@@ -376,6 +398,7 @@ jobs:
             --lang "$TARGET_LANG"
 
       - name: 修复占位符错误并清理无效条目
+        if: steps.strategy.outputs.mode == 'ai'
         env:
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
@@ -388,6 +411,7 @@ jobs:
             --source-root zed
 
       - name: 推送到 i18n 分支
+        if: steps.strategy.outputs.mode == 'ai'
         run: |
           cp string.json string_context.json scan_result.json /tmp/
           cp -r i18n/ /tmp/i18n-result/
@@ -412,9 +436,54 @@ jobs:
           git diff --cached --quiet || git commit -m "feat(i18n): 更新提取与翻译结果"
           git push origin i18n
 
+      - name: 同步上游 i18n 基线
+        if: steps.strategy.outputs.mode == 'sync_upstream'
+        env:
+          VERSION: ${{ steps.params.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          rm -rf /tmp/upstream-i18n /tmp/i18n-branch
+          git clone --branch i18n --single-branch --depth 1 \
+            "https://github.com/x6nux/zed-globalization.git" \
+            /tmp/upstream-i18n
+
+          if git ls-remote --heads origin i18n | grep -q i18n; then
+            git clone --branch i18n --single-branch --depth 1 \
+              "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+              /tmp/i18n-branch
+          else
+            mkdir -p /tmp/i18n-branch
+            cd /tmp/i18n-branch
+            git init
+            git checkout -b i18n
+            git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          fi
+
+          mkdir -p /tmp/i18n-branch/config
+          cp /tmp/upstream-i18n/scan_result.json /tmp/i18n-branch/ 2>/dev/null || true
+          cp /tmp/upstream-i18n/string.json /tmp/i18n-branch/ 2>/dev/null || true
+          cp /tmp/upstream-i18n/string_context.json /tmp/i18n-branch/ 2>/dev/null || true
+          cp /tmp/upstream-i18n/config/do_not_translate.json /tmp/i18n-branch/config/do_not_translate.json
+          rsync -a --delete /tmp/upstream-i18n/i18n/ /tmp/i18n-branch/i18n/
+
+          cd /tmp/i18n-branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/do_not_translate.json i18n/
+          [ -f string.json ] && git add string.json
+          [ -f string_context.json ] && git add string_context.json
+          [ -f scan_result.json ] && git add scan_result.json
+          if git diff --cached --quiet; then
+            echo "上游 i18n 基线无变化"
+          else
+            git commit -m "chore(i18n): sync upstream baseline for ${VERSION}"
+            git push origin i18n
+          fi
+
       # 定时触发或手动+chain 时链式调用构建
       - name: 触发构建工作流
-        if: github.event_name == 'schedule' || inputs.chain == true
+        if: steps.strategy.outputs.mode == 'ai' && (github.event_name == 'schedule' || inputs.chain == true)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -429,3 +498,17 @@ jobs:
             -f "client_payload[version]=${{ steps.params.outputs.VERSION }}" \
             -f "client_payload[lang]=$LANG_VALUE" \
             -f "client_payload[is_prerelease]=${{ matrix.is_prerelease }}"
+
+      - name: 触发 LC 个人构建
+        if: steps.strategy.outputs.mode == 'sync_upstream' && (github.event_name == 'schedule' || inputs.chain == true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.params.outputs.VERSION }}
+          TARGET_LANG: ${{ steps.params.outputs.TARGET_LANG }}
+        run: |
+          gh workflow run 99-lc-macos-aarch64.yml \
+            --ref main \
+            -f version="$VERSION" \
+            -f lang="$TARGET_LANG" \
+            -f jobs=4 \
+            -f use_sccache=true
