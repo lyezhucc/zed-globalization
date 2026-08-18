@@ -1,5 +1,5 @@
 {
-  "version": "v1.15.0",
+  "version": "v1.16.0-pre",
   "files": [
     "crates/acp_thread/src/acp_thread.rs",
     "crates/acp_thread/src/connection.rs",
